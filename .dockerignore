@@ -1,0 +1,14 @@
+.git
+.env
+.env.*
+!.env.example
+out/
+in/*
+!in/.gitkeep
+**/__pycache__/
+**/*.py[cod]
+tests/
+scripts/
+README.md
+IMPLEMENTATION_PLAN.md
+DECISIONS.md

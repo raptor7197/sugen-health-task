@@ -1,0 +1,11 @@
+.env
+.env.*
+!.env.example
+._*
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.coverage
+out/*.jsonl
+in/*.jsonl
+*.bundle
