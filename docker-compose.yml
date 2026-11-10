@@ -1,0 +1,19 @@
+services:
+  coder:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: sugen-icd11-coder:local
+    working_dir: /app
+    volumes:
+      - ./in:/in:ro,Z
+      - ./out:/out:rw,Z
+    environment:
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      HTTPS_PROXY: ${HTTPS_PROXY:-}
+      CODER_PROVIDER: ${CODER_PROVIDER:-}
+      CODER_MODEL: ${CODER_MODEL:-}
+      CODER_MAX_USD: ${CODER_MAX_USD:-4.50}
+      CODER_MAX_MODEL_CALLS: ${CODER_MAX_MODEL_CALLS:-600}
+      CODER_MODEL_DEADLINE_SECONDS: ${CODER_MODEL_DEADLINE_SECONDS:-3000}
