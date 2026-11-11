@@ -1,23 +1,40 @@
 from __future__ import annotations
 
+import heapq
 import math
 import re
 from collections import Counter
 from dataclasses import dataclass
 from typing import Any
 
-from .catalog import Catalogue, Category, TOKEN_RE
+from .catalog import Catalogue, TOKEN_RE, normalize_code
 
-STOP = frozenset("a an and are as at be been by for from had has have in into is it its of on or that the their then there this to was were with without".split())
+STOP = frozenset(
+    "a an and are as at be been by for from had has have in into is it its of on or that the their then there this to was were with without".split()
+)
 DIAGNOSIS_RE = re.compile(
     r"(?:^|\n)\s*(?:a|dx|imp|assessment|diagnosis|impression)\s*[:=-]\s*([^\n]+)"
     r"|\b(?:diagnosed with|working diagnosis(?: is)?|the diagnosis is|this is|assessment is)\s+([^\n.;!?]{1,180})",
     re.IGNORECASE,
 )
+NEGATORS = frozenset(
+    "no not without denies deny denied absent negative nil none never nor excluded ruled unlikely free".split()
+)
+NEGATION_WINDOW = 2
+SCOPE_BREAKERS = frozenset("vs versus against for about due per with of to".split())
+TOP_K = 64
+# ICD-11 chapters 21 (symptoms/signs/findings), 23 (factors influencing health)
+# and 24 (assessment of health) describe findings, not the visit diagnosis. They stay
+# as candidates but must not outrank a documented disease code.
+FINDING_CHAPTERS = frozenset({"21", "23", "24"})
+FINDING_DISCOUNT = 0.55
+# Chapter 26 holds traditional-medicine patterns (TM1/TM2). They are supplementary
+# categories, not claimable outpatient diagnoses, so they should not win a slot.
+TRADITIONAL_MEDICINE_CHAPTER = "26"
+TRADITIONAL_MEDICINE_DISCOUNT = 0.15
 
-
-# High-precision terminology for common outpatient diagnoses. Every target is checked
-# against the selected MMS release at runtime; unsupported targets are ignored.
+# Curated high-precision outpatient terminology. Each target is checked against the
+# loaded MMS release, so a rule can never emit a code outside the catalogue.
 CLINICAL_RULES: tuple[tuple[re.Pattern[str], str, str], ...] = (
     (re.compile(r"\b(?:p\.?\s*falciparum|falciparum)\b.{0,90}\bmalaria\b|\bmalaria\b.{0,90}\b(?:falciparum|p\.?\s*falciparum)\b", re.I | re.S), "1F40.Z", "falciparum malaria evidence"),
     (re.compile(r"\b(?:typhoid|enteric fever)\b", re.I), "1A07.Z", "typhoid or enteric fever term"),
@@ -25,15 +42,48 @@ CLINICAL_RULES: tuple[tuple[re.Pattern[str], str, str], ...] = (
     (re.compile(r"\b(?:chickenpox|varicella)\b", re.I), "1E90.0", "varicella term"),
     (re.compile(r"\b(?:asthma attack|acute asthma exacerbation|asthma exacerbation)\b", re.I), "CA23.30", "acute asthma exacerbation term"),
     (re.compile(r"\bcommunity[- ]acquired pneumonia\b", re.I), "CA40.Z", "community-acquired pneumonia term"),
-    (re.compile(r"\btype\s*2\s*diabetes(?: mellitus)?\b", re.I), "5A11.0", "type 2 diabetes term"),
+    (re.compile(r"\btype\s*2\s*diabetes(?:\s*mellitus)?\b|\bT2DM\b|\bDM\s*2\b", re.I), "5A11", "type 2 diabetes term"),
+    (re.compile(r"\bimpaired fasting glucose\b|\braised fasting (?:glucose|sugar)\b", re.I), "5A40.0", "impaired fasting glucose term"),
+    (re.compile(r"\bpre-?diabetes\b|\bintermediate hyperglycaemia\b", re.I), "5A40", "intermediate hyperglycaemia term"),
 )
 
-def _weighted_tokens(text: str) -> Counter[str]:
-    counts = Counter(token.lower() for token in TOKEN_RE.findall(text) if token.lower() not in STOP)
+
+def _is_negated(prefix: str) -> bool:
+    """True when a short trailing window of the note negates the upcoming finding."""
+    window = re.split(r"[.;:\n]", prefix[-80:])[-1]
+    tokens = TOKEN_RE.findall(window.lower())[-NEGATION_WINDOW:]
+    if any(token in SCOPE_BREAKERS for token in tokens):
+        return False
+    return any(token in NEGATORS for token in tokens)
+
+
+def _query_tokens(text: str) -> Counter[str]:
+    """Token counts with the assessment block boosted and negated findings dropped."""
+    tokens = [token.lower() for token in TOKEN_RE.findall(text)]
+    counts: Counter[str] = Counter()
+    for index, token in enumerate(tokens):
+        if token in STOP:
+            continue
+        left = tokens[max(0, index - NEGATION_WINDOW):index]
+        if any(prev in NEGATORS for prev in left) and not any(prev in SCOPE_BREAKERS for prev in left):
+            continue
+        counts[token] += 1
     for match in DIAGNOSIS_RE.finditer(text):
         focused = match.group(1) or match.group(2) or ""
-        counts.update({token.lower(): 3 for token in TOKEN_RE.findall(focused) if token.lower() not in STOP})
+        for token in TOKEN_RE.findall(focused):
+            token = token.lower()
+            if token not in STOP:
+                counts[token] += 3
     return counts
+
+
+def _clip(text: str, head: int = 6000, tail: int = 4000) -> str:
+    """Keep the start, the assessment, and the tail instead of blindly truncating."""
+    if len(text) <= head + tail:
+        return text
+    spans = [match.group(1) or match.group(2) or "" for match in DIAGNOSIS_RE.finditer(text)]
+    diagnosis = "\n".join(span.strip() for span in spans if span.strip())[:2000]
+    return "\n".join(part for part in (text[:head], diagnosis, text[-tail:]) if part)
 
 
 @dataclass(frozen=True)
@@ -48,72 +98,89 @@ class Coder:
         self.catalogue = catalogue
         self.docs = list(catalogue.categories.values())
         self.df: Counter[str] = Counter()
-        self.doc_tokens: dict[str, Counter[str]] = {}
-        self.postings: dict[str, list[tuple[str, int, int]]] = {}
+        self.postings: dict[str, list[tuple[str, float, int]]] = {}
+        depths: dict[str, float] = {}
+        discount: dict[str, float] = {}
         for category in self.docs:
             terms = Counter(token for token in category.tokens if token not in STOP)
-            self.doc_tokens[category.code] = terms
             length = sum(terms.values())
+            depth_bonus = 0.012 * category.depth + (0.015 if category.leaf else 0.0)
+            depths[category.code] = depth_bonus
+            discount[category.code] = (
+                TRADITIONAL_MEDICINE_DISCOUNT
+                if category.chapter == TRADITIONAL_MEDICINE_CHAPTER
+                else FINDING_DISCOUNT if category.chapter in FINDING_CHAPTERS else 1.0
+            )
             for term, frequency in terms.items():
                 self.df[term] += 1
                 self.postings.setdefault(term, []).append((category.code, frequency, length))
-        self.avg_len = sum(sum(v.values()) for v in self.doc_tokens.values()) / max(1, len(self.docs))
+        self.length_bonus = depths
+        self.discount = discount
+        self.avg_len = sum(
+            sum(1 for token in category.tokens if token not in STOP) for category in self.docs
+        ) / max(1, len(self.docs))
         self.fallback = "MG26" if "MG26" in catalogue.codes else min(catalogue.codes)
-        self.training = []
+        self.training: list[tuple[str, dict[str, float], list[str]]] = []
+        self.training_df: Counter[str] = Counter()
+        self.training_count = 0
         if training_rows:
             self._load_training(training_rows)
 
     def _load_training(self, rows: list[dict[str, Any]]) -> None:
-        cleaned = []
+        cleaned: list[tuple[str, Counter[str], list[str]]] = []
         frequencies: Counter[str] = Counter()
         for row in rows:
-            note_text = str(row.get("text") or "")
-            tokens = _weighted_tokens(note_text)
+            tokens = _query_tokens(str(row.get("text") or ""))
             codes = [str(code).upper() for code in row.get("gold", []) if str(code).upper() in self.catalogue.codes]
             if not tokens or not codes:
                 continue
             frequencies.update(tokens.keys())
             cleaned.append((str(row.get("id", "")), tokens, codes))
-        count = max(1, len(cleaned))
         self.training_df = frequencies
-        self.training_count = count
+        self.training_count = max(1, len(cleaned))
         for note_id, tokens, codes in cleaned:
-            weights = {token: (1.0 + math.log(freq)) * math.log(1.0 + count / (1 + frequencies[token])) for token, freq in tokens.items()}
+            weights = {
+                token: (1.0 + math.log(freq)) * math.log(1.0 + self.training_count / (1 + frequencies[token]))
+                for token, freq in tokens.items()
+            }
             norm = math.sqrt(sum(weight * weight for weight in weights.values())) or 1.0
             self.training.append((note_id, {token: weight / norm for token, weight in weights.items()}, codes))
 
-    def _rank(self, text: str) -> list[Ranked]:
-        query = _weighted_tokens(text)
+    def _rank(self, query: Counter[str]) -> list[Ranked]:
         if not query:
             category = self.catalogue.get(self.fallback)
             return [Ranked(self.fallback, 0.0, (category.title if category else "fallback",))]
         n_docs = len(self.docs)
         scores: Counter[str] = Counter()
-        matched_terms: dict[str, list[str]] = {}
+        matched: dict[str, list[str]] = {}
         for term, qfreq in query.items():
-            postings = self.postings.get(term, ())
+            postings = self.postings.get(term)
             if not postings:
                 continue
             idf = math.log(1.0 + (n_docs - self.df[term] + 0.5) / (self.df[term] + 0.5))
+            weight = min(qfreq, 2) * idf
             for code, tf, length in postings:
-                denom = tf + 1.2 * (1.0 - 0.75 + 0.75 * length / max(1.0, self.avg_len))
-                scores[code] += idf * (tf * 2.2 / denom) * min(qfreq, 2)
-                matched_terms.setdefault(code, []).append(term)
-        results: list[Ranked] = []
-        for code, score in scores.items():
-            category = self.catalogue.categories[code]
-            score += 0.012 * category.depth
-            if category.leaf:
-                score += 0.015
-            results.append(Ranked(code, score, tuple(matched_terms[code][:8])))
-        results.sort(key=lambda item: (-item.score, item.code))
-        return results
-
-    def _example_matches(self, text: str, exclude_id: str | None = None) -> list[tuple[float, str, list[str]]]:
-        if not self.training:
+                denom = tf + 1.2 * (0.25 + 0.75 * length / max(1.0, self.avg_len))
+                scores[code] += weight * (tf * 2.2 / denom)
+                matched.setdefault(code, []).append(term)
+        if not scores:
             return []
-        query = _weighted_tokens(text)
-        if not query:
+        # A candidate that shares only one incidental token with a long note must not
+        # beat a candidate that explains much of the note. Coverage guards that.
+        query_terms = max(1, len(query))
+        adjusted = {}
+        for code, score in scores.items():
+            if query_terms >= 5:
+                coverage = len(matched.get(code, ())) / query_terms
+                factor = 0.55 + 0.45 * min(1.0, coverage * 3.0)
+            else:
+                factor = 1.0
+            adjusted[code] = score * self.discount.get(code, 1.0) * factor + self.length_bonus.get(code, 0.0)
+        best = heapq.nlargest(TOP_K, adjusted.items(), key=lambda item: (item[1], item[0]))
+        return [Ranked(code, score, tuple(matched.get(code, ())[:8])) for code, score in best]
+
+    def _example_matches(self, query: Counter[str], exclude_id: str | None = None) -> list[tuple[float, str, list[str]]]:
+        if not self.training or not query:
             return []
         weights = {
             token: (1.0 + math.log(freq)) * math.log(1.0 + self.training_count / (1 + self.training_df[token]))
@@ -131,28 +198,60 @@ class Coder:
         matches.sort(reverse=True, key=lambda item: item[0])
         return matches[:5]
 
+    def _prefer_specific(self, scores: dict[str, float]) -> list[str]:
+        """Drop a parent code when a competitive, more specific child is present.
+
+        The scorer awards only exact matches and the brief states gold is the most
+        specific supported code, so a parent must never outrank its own child.
+        """
+        ordered = sorted(scores, key=lambda code: (-scores[code], code))[:TOP_K]
+        present = set(ordered)
+        keep: list[str] = []
+        for code in ordered:
+            prefix = code + "."
+            dominated = any(
+                other.startswith(prefix) and scores[other] >= 0.35 * scores[code]
+                for other in present
+                if other != code
+            )
+            if not dominated:
+                keep.append(code)
+        return keep or ordered
+
     def predict(self, text: str, note_id: str | None = None) -> tuple[list[str], dict[str, Any]]:
-        safe_text = str(text or "")[:12000]
-        ranked = self._rank(safe_text)
+        safe_text = _clip(str(text or ""))
+        query = _query_tokens(safe_text)
+        ranked = self._rank(query)
         scores = {item.code: item.score for item in ranked}
-        evidence: dict[str, list[str]] = {item.code: list(item.evidence) for item in ranked[:8]}
-        sources: dict[str, str] = {item.code: "title-search" for item in ranked[:8]}
+        evidence: dict[str, list[str]] = {item.code: list(item.evidence) for item in ranked}
+        sources: dict[str, str] = {item.code: "title-search" for item in ranked}
         for pattern, code, reason in CLINICAL_RULES:
-            if code in self.catalogue.codes and pattern.search(safe_text):
+            if code not in self.catalogue.codes:
+                continue
+            for match in pattern.finditer(safe_text):
+                if _is_negated(safe_text[:match.start()]):
+                    continue
                 scores[code] = max(scores.get(code, 0.0), 100.0)
                 evidence.setdefault(code, []).append(reason)
                 sources[code] = "clinical-rule"
-        for similarity, matched_id, matched_codes in self._example_matches(safe_text, note_id):
+                break
+        for similarity, matched_id, matched_codes in self._example_matches(query, note_id):
             for code in matched_codes:
                 scores[code] = scores.get(code, 0.0) + similarity * 12.0
                 evidence.setdefault(code, []).append(f"similar training note {matched_id} ({similarity:.2f})")
-                sources[code] = "training-neighbor"
-        ordered = sorted(scores, key=lambda code: (-scores[code], code))
-        if not ordered:
-            ordered = [self.fallback]
+                if sources.get(code) != "clinical-rule":
+                    sources[code] = "training-neighbor"
+        if not scores:
+            scores = {self.fallback: 0.0}
             evidence[self.fallback] = ["no lexical match; safe valid fallback"]
             sources[self.fallback] = "fallback"
-        codes = ordered[:3]
+        elif not query:
+            sources[self.fallback] = "fallback"
+            evidence.setdefault(self.fallback, ["empty note; safe valid fallback"])
+        codes = self._prefer_specific(scores)[:3]
+        if not codes:
+            codes = [self.fallback]
+            scores.setdefault(self.fallback, 0.0)
         for code in codes:
             evidence.setdefault(code, [])
             sources.setdefault(code, "title-search")
@@ -167,23 +266,24 @@ class Coder:
         return codes, audit
 
     def candidate_details(self, text: str, limit: int = 24, note_id: str | None = None) -> list[dict[str, str]]:
-        codes, _ = self.predict(text, note_id)
-        ranked = self._rank(str(text or "")[:12000])
+        safe_text = _clip(str(text or ""))
+        query = _query_tokens(safe_text)
+        codes, _ = self.predict(safe_text, note_id)
         order = list(codes)
-        order.extend(item.code for item in ranked if item.code not in order)
-        return [
-            {"code": code, "title": self.catalogue.categories[code].title}
-            for code in order[:limit]
-        ]
+        for item in self._rank(query):
+            if item.code not in order:
+                order.append(item.code)
+        return [{"code": code, "title": self.catalogue.categories[code].title} for code in order[:limit]]
 
-    def rerank(self, text: str, proposed: list[str]) -> list[str]:
+    def rerank(self, text: str, proposed: list[str], note_id: str | None = None) -> list[str]:
         chosen: list[str] = []
         for value in proposed:
-            code = value.strip().upper()
-            if code in self.catalogue.codes and code not in chosen:
+            code = normalize_code(str(value))
+            if code and code in self.catalogue.codes and code not in chosen:
                 chosen.append(code)
             if len(chosen) == 3:
                 break
-        fallback, _ = self.predict(text)
-        chosen.extend(code for code in fallback if code not in chosen)
+        if len(chosen) < 3:
+            fallback, _ = self.predict(text, note_id)
+            chosen.extend(code for code in fallback if code not in chosen)
         return chosen[:3]
