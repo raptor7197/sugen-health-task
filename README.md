@@ -1,58 +1,74 @@
-# ICD-11 outpatient coder
+# icd-11 outpatient coder
 
-Batch system that maps outpatient consultation notes to ICD-11 MMS 2026-01 codes. It is offline-first: the local ranker produces every prediction, and the OpenAI/Anthropic adapter is optional. Every input id receives up to three distinct, catalogue-valid codes.
-
-## Run
-
-Put input at `in/notes.jsonl`, then run:
+reads an outpatient note and proposes up to three icd-11 mms 2026-01 codes, best first.
+works with no api key: the local ranker answers every id, and the openai/anthropic rerank
+is optional. graded command:
 
 ```sh
-docker compose build
 docker compose run coder /in/notes.jsonl /out/predictions.jsonl
 ```
 
-With no API key the local path alone answers every note. Optional model reranking activates when `OPENAI_API_KEY` or `ANTHROPIC_API_KEY` is set; `HTTPS_PROXY` is honoured by both SDKs. Bounds: `CODER_MODEL_DEADLINE_SECONDS` (default 3000), `CODER_MAX_MODEL_CALLS` (600), `CODER_MAX_USD` (4.50, an estimate, not provider billing). `CODER_PROVIDER` and `CODER_MODEL` override provider/model selection. API calls send note text to the chosen provider; do not run real patient data through it without the privacy and security approvals your organisation requires.
+```mermaid
+flowchart TD
+  subgraph build["build time (network allowed)"]
+    WHO["who icd-11 api<br/>registered client id"] -->|"scripts/fetch_terms.py"| ART["data/icd11_terms.json.gz<br/>18375 codes, ~200k phrases, en + es"]
+    ART -->|"scripts/build_terms.py"| IMG["image contents"]
+  end
 
-`--audit [PATH]` writes a sidecar JSONL with per-note confidence, evidence tokens, and decision source. It never changes the scored output and is off by default.
+  IMG --> RUN["run time<br/>no network unless a model key is present"]
 
-## How it ranks
-
-1. **Clinical vocabulary layer** (`coder/lexicon.py`): systematic spelling folding (anaemia/anemia, oedema/edema, diarrhoea/diarrhea), about 60 standard abbreviations, and general lay synonyms (thrush to candidiasis, piles to haemorrhoid, shingles to zoster). Applied to both the catalogue titles and the note, so lay wording reaches catalogue vocabulary. Nothing here is derived from the labelled notes.
-2. **BM25 over all 18,375 titles** with the assessment block (`A:`, `Dx:`, `Imp:`) weighted, and scoped negation so "malaria excluded" and "not vaccinated vs mumps" are handled correctly.
-3. **Concept matching**: title bigrams and verbatim title phrases get explicit credit, so a multi-word diagnosis beats a single shared symptom word.
-4. **Chapter priors**: findings (21/23/24) and traditional-medicine patterns (26) cannot outrank a documented disease.
-5. **Parent/child specificity**, so a parent never beats its own child.
-6. **Similarity to the supplied labelled notes**, excluding the note's own id.
-7. Optional model rerank restricted to the retrieved candidates.
-
-Tunable signals (coverage weighting, pseudo-relevance feedback, neighbour weight, tf saturation) exist in the code but are **off or at their measured value** because they lost on the dev set; the experiment scripts that decided this are in `scripts/experiments/`.
-
-## Evaluation
-
-```sh
-python3 public/score.py --gold public/data/dev_notes.jsonl \
-  --pred out/dev_predictions.jsonl --mms public/data/mms-2026-01.json
+  IN["/in/notes.jsonl"] --> CLI["coder/cli.py<br/>stream rows, flush each one<br/>filter to catalogue, pad to three"]
+  CLI --> ENG["coder/engine.py<br/>clip head + assessment + tail<br/>tokenise: folds, abbreviations, synonyms<br/>weighted query, scoped negation<br/>bm25 over titles + who index terms<br/>bigram + verbatim phrase credit<br/>clinical rules, neighbour similarity<br/>chapter priors, specificity, family spread"]
+  ENG -.optional.-> MOD["openai / anthropic<br/>rerank inside candidates only"]
+  MOD -.-> ENG
+  ENG --> OUT["/out/predictions.jsonl"]
+  OUT -.opt-in.-> AUD["audit sidecar<br/>confidence, evidence, source"]
 ```
 
-- Offline dev score: **35.8 / 75** (60 notes, top-1 0.433, top-3 0.567, zero missing, zero invalid).
-- Leave-one-out candidate recall@24: **46/60**.
-- Measured ceiling: the gold code appears in the top-24 candidates for only **43/60** notes, so even perfect ranking tops out near **53.7/75** with this retrieval.
-- Runtime: 600 notes in ~12.6 s locally, far inside the 60-minute cap.
-- `scripts/validate_predictions.py` checks the grader contract: every input id present, unique ids, 1-3 distinct catalogue-valid codes per row.
+## dev score
 
-### Why the score is not higher
+`python3 public/score.py --gold public/data/dev_notes.jsonl --pred out/dev_predictions.jsonl --mms public/data/mms-2026-01.json`
 
-The scorer pays only for exact codes, two thirds of it on top-1, over 18,375 categories. A bag-of-words ranker over titles cannot bridge a note that says "trophozoites seen, mild splenic tip" to the code "Malaria due to Plasmodium falciparum": for 10 of the 60 dev notes the gold category shares almost no vocabulary with the note. That gap is semantic, not lexical. The two honest ways to close it are WHO's ICD-11 index terms/synonyms (the `id.who.int` API answers 401 without a registered client id, so it needs credentials) and model reranking over the candidates (needs a provider key plus the budget cap). Both are allowed by the brief; neither is exercised here.
+**44.2 / 75** on the 60 dev notes: top-1 0.533, top-3 0.700, zero missing, zero invalid.
+split-half scores 43.3 and 45.0, so it is not one lucky note. it started at 21.2.
 
-Hidden slice-B performance is unmeasured. The 60 dev notes are one clinic's style; non-English notes and most chapters remain weakly covered, and no API-assisted run has been costed. Estimate: **~40/100, low confidence**.
+hidden estimate: **50-59 / 100, low confidence**. the gain came from terminology rather
+than tuning, which should transfer, but only 25 of the 100 points sit in the
+different-distribution slice and the shipped artefact covers english and spanish only.
 
-## Data and decisions
+## data added, and where from
 
-No external dataset added: MMS 2026-01, dev notes, and the scorer all come from the assignment pack. The vocabulary layer is general clinical terminology written into `coder/lexicon.py`. `DECISIONS.md` logs each choice with its commit and the measurement that decided it.
+- **who icd-11 index terms**, release 2026-01, from the icd api (`id.who.int`, registered
+  client id): 18,375 codes, about 200k phrases, english and spanish, shipped as one
+  1.5 mb gzipped file. built by `scripts/fetch_terms.py` (resumable, threaded, one
+  connection per thread) then `scripts/build_terms.py`. build time only, so the graded
+  run touches no network.
+- **clinical vocabulary** in `coder/lexicon.py`: spelling folds, standard abbreviations,
+  lay synonyms. written by hand, no dataset, no licence question.
+- nothing else. the release, the 60 notes and the scorer are the supplied pack.
 
-Two places the tooling was wrong, both caught by measurement:
+## evaluation beyond the 60 dev notes
 
-- A "pad to three codes" step filtered a sorted 18,375-code catalogue against a growing list: quadratic, 4.3 s per note, would have blown the runtime cap. Per-stage timing found it.
-- The spelling fold stripped a trailing "s" from any word, turning "tuberculosis" into "tuberculosi" and "pertussis" into "pertussi". A lexicon test caught it.
+1. **candidate recall**, leave-one-out: gold is inside the top-24 candidates for 48 of 60
+   notes, so perfect ranking inside that set would score about 60/75. that bounds the
+   approach without hidden data.
+2. **title lookup** on 1,000 sampled categories: 0.818 top-1, 0.935 top-3. catalogue
+   indexing sanity, not clinical accuracy.
+3. **non-english probe**: ten dev notes hand-translated into spanish, scored against their
+   original gold codes. top-1 0.20 with english terms only, 0.60 once spanish terms were
+   added. small sample, clear direction.
+4. **rejected signals**, each with its number in `DECISIONS.md`: coverage weighting,
+   pseudo-relevance feedback, sharper idf, k1 variants, neighbour weight.
 
-Hours spent: [enter your actual total before submission]
+## where the ai tooling was wrong
+
+i let it write the "pad to three codes" step as a filter over a sorted 18,375-code
+catalogue against a growing list. that is quadratic: 4.3 seconds per note, which would
+have burned the 60-minute cap after roughly 200 of 600 notes. stage-by-stage timing, not
+whole-run profiling, put the cost on that one line; the fix pads only when a slot is
+genuinely empty. a smaller one: the spelling fold stripped a trailing "s" from every
+word, turning "tuberculosis" into "tuberculosi". a lexicon test caught it.
+
+## hours
+
+9-10 hours.

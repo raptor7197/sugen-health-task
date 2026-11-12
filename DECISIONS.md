@@ -77,3 +77,38 @@
 - Decision: stop tuning lexical constants and document the ceiling instead of chasing decimal points. The gold code is inside the top-64 candidates for 50/60 notes and top-24 for 43/60, so perfect ranking would score about 53.7/75.
 - Evidence: `scripts/diagnostics/ceiling.py`. Ten notes have gold sharing almost no vocabulary with the note text, which no lexical ranker can recover.
 - Revisit: the remaining headroom needs WHO index terms/synonyms (API credentials) or model reranking over candidates (provider key plus the $6 cap). Both fit the brief and neither is measured here.
+
+## 2026-11-12 21:18 IST — who index terms, and the connection that made them affordable
+
+- Commit: `fd1b772`
+- Decision: fetch index terms for all 18,375 categories from the WHO ICD API (client id supplied by the user, credentials kept out of the repository) and ship them as one gzipped artefact built at build time. Options considered: a model-generated synonym dump (no key, hallucination risk), UMLS (needs a licence application), and staying title-only at 35.8.
+- Evidence: dev score 35.8 to 44.2, top-1 0.433 to 0.533, top-3 0.567 to 0.700; gold in the top-24 candidates rose from 43/60 to 48/60, so the ceiling moved from 53.7 to 60.0. Fetch was 703 ms per request with one connection each (215 minutes projected); reusing one connection per thread cut it to 224 ms and completed 18,375 codes in six minutes at six threads, with no failures.
+- Revisit: french, portuguese, arabic and chinese are the same one-command extension; they were deliberately not fetched because the brief caps the deliverable and the Spanish probe already showed the mechanism works.
+
+## 2026-11-12 21:20 IST — phrase credit retuned, stability preferred over the peak
+
+- Commit: `fd1b772`
+- Decision: set phrase credit to 20 with `b = 1.0` rather than the higher-scoring 16-with-`b = 0.9`. Options: 12, 16, 20, 30, and the `b`/`k1` combinations around them.
+- Evidence: 16 with `b = 0.9` scored 45.8 but split 40.8/50.8 across halves; 20 with `b = 1.0` scored 44.2 and split 43.3/45.0. One note is 1.5 points on 60 notes, so a 1.6-point peak on a 10-point spread is noise.
+- Revisit: re-tune on a larger labelled set where half-split spread is meaningful.
+
+## 2026-11-12 21:24 IST — spanish terms, and what they bought
+
+- Commit: `fd1b772`
+- Decision: ship english and spanish index terms together in one artefact rather than english only. Spanish is a proxy for the brief's "not always in english" slice; the same fetch returns any WHO language, so this is the mechanism, not a claim about the hidden distribution.
+- Evidence: ten dev notes hand-translated into spanish, scored against their original gold codes: top-1 0.20 with english terms only, top-3 0.20; top-1 0.60, top-3 0.70 with spanish terms added. English dev score was unaffected by the merge (44.2).
+- Revisit: the sample is ten notes; treat it as evidence the mechanism works, not a slice-b score.
+
+## 2026-11-12 21:30 IST — the terms loader only worked for absolute paths
+
+- Commit: `fd1b772`
+- Decision: resolve the mms path before deriving the artefact location, so relative and absolute invocations load the same file. Caught before shipping, not after.
+- Evidence: the CLI scored 35.0 while the experiment harness, which passed the term map directly, scored 44.2. The difference was the loader computing `public/data/` instead of the repository root for a relative path; `Path.resolve()` fixed it and the CLI then reproduced 44.2 exactly.
+- Revisit: none needed, but the mismatch is why the CLI and the harness must be cross-checked rather than trusting one of them.
+
+## 2026-11-12 21:45 IST — scope cut back to the brief
+
+- Commit: this commit (`docs: cut readme to the brief's one page and log the terminology work`)
+- Decision: stop fetching extra languages and cut the README back to the brief's one-page limit. The README had grown to 12 KB across ten sections, which the brief does not allow; extra languages were the same one-command extension as Spanish, not new capability.
+- Evidence: brief section "Deliverable" item 2 says "A README of one page at most" and lists four required points; the rewritten file covers those four plus a mermaid diagram and the run command.
+- Revisit: if the reviewer wants depth, the reasoning lives in this log and in `scripts/experiments/`, not in the README.
