@@ -9,3 +9,4 @@ __pycache__/
 out/*.jsonl
 in/*.jsonl
 *.bundle
+data/.cache/

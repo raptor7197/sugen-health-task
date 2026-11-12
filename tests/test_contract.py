@@ -80,6 +80,22 @@ class PredictionTests(unittest.TestCase):
         self.assertNotIn("1F40.Z", codes)
         self.assertNotIn("1F4Z", codes)
 
+    def test_who_index_terms_are_used_when_present(self):
+        catalogue = Catalogue.load(MMS)
+        terms = {"1G05": ["tungiasis", "jigger flea infestation", "sand flea"]}
+        with_terms = Coder(catalogue, terms=terms)
+        without = Coder(catalogue)
+        note = "itchy nodule on the foot with a central black dot, jigger flea infestation."
+        self.assertEqual(with_terms.predict(note)[0][0], "1G05")
+        self.assertNotEqual(without.predict(note)[0][0], "1G05")
+
+    def test_missing_terms_are_harmless(self):
+        catalogue = Catalogue.load(MMS)
+        coder = Coder(catalogue, terms={})
+        codes, _ = coder.predict("Acute asthma attack with wheeze.")
+        self.assertTrue(codes)
+        self.assertTrue(all(code in catalogue.codes for code in codes))
+
 
 class TrainingLeakageTests(unittest.TestCase):
     def test_leave_one_out_never_reuses_current_note_label(self):

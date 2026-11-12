@@ -124,7 +124,7 @@ class Coder:
         use_lexicon: bool = True,
         use_post_negation: bool = True,
         use_phrase_bonus: bool = True,
-        phrase_bonus: float = 5.0,
+        phrase_bonus: float = 20.0,
         use_specificity: bool = True,
         neighbour_weight: float = 12.0,
         neighbour_count: int = 5,
@@ -135,6 +135,11 @@ class Coder:
         use_prf: bool = False,
         prf_weight: float = 2.0,
         prf_docs: int = 2,
+        terms: dict[str, list[str]] | None = None,
+        use_terms_index: bool = True,
+        use_terms_phrases: bool = True,
+        title_repeat: int = 1,
+        max_phrases: int = 8,
     ):
         self.catalogue = catalogue
         self.anchor_weight = anchor_weight
@@ -155,14 +160,35 @@ class Coder:
         self.use_prf = use_prf
         self.prf_weight = prf_weight
         self.prf_docs = prf_docs
+        self.use_terms_index = use_terms_index
+        self.use_terms_phrases = use_terms_phrases
+        self.title_repeat = title_repeat
+        self.max_phrases = max_phrases
+        term_source = terms or {}
         self.docs = list(catalogue.categories.values())
         self.df: Counter[str] = Counter()
         self.postings: dict[str, list[tuple[str, float, int]]] = {}
         depths: dict[str, float] = {}
         discount: dict[str, float] = {}
         words_by_code: dict[str, list[str]] = {}
+        self.phrases: dict[str, list[str]] = {}
         for category in self.docs:
-            words = [token for token in self._tokens(category.title) if token not in STOP]
+            title_words = [token for token in self._tokens(category.title) if token not in STOP]
+            code_terms = term_source.get(category.code, []) if (self.use_terms_index or self.use_terms_phrases) else []
+            term_words: list[str] = []
+            term_phrases: list[str] = []
+            for term in code_terms:
+                tokens = [token for token in self._tokens(term) if token not in STOP]
+                if not tokens:
+                    continue
+                term_words.extend(tokens)
+                if len(tokens) >= 2:
+                    phrase = " ".join(tokens)
+                    if phrase not in term_phrases:
+                        term_phrases.append(phrase)
+            self.phrases[category.code] = term_phrases[:self.max_phrases]
+            title_block = title_words * max(1, self.title_repeat)
+            words = title_block + (term_words if self.use_terms_index else [])
             words_by_code[category.code] = words
             terms = Counter(words)
             length = sum(terms.values())
@@ -181,8 +207,13 @@ class Coder:
         self.title_text = {code: " ".join(words) for code, words in words_by_code.items()}
         self.bigrams: dict[str, list[str]] = {}
         for code, words in words_by_code.items():
+            seen_pairs: set[str] = set()
             for index in range(len(words) - 1):
-                self.bigrams.setdefault(f"{words[index]} {words[index + 1]}", []).append(code)
+                pair = f"{words[index]} {words[index + 1]}"
+                if pair in seen_pairs:
+                    continue
+                seen_pairs.add(pair)
+                self.bigrams.setdefault(pair, []).append(code)
         self.rare_title_token = {
             code: any(self.df.get(token, 0) <= 3 for token in words)
             for code, words in words_by_code.items()
@@ -347,18 +378,24 @@ class Coder:
         if self.use_phrase_bonus:
             note_norm = " " + " ".join(words) + " "
             for item in ranked[:TOP_K]:
-                title = self.title_text.get(item.code, "")
-                if not title:
-                    continue
-                words = title.split()
-                # A verbatim concept mention is strong evidence, but a one-word title
-                # only counts when that word is rare enough to be specific.
-                if len(words) < 2 and not self.rare_title_token.get(item.code, False):
-                    continue
-                if f" {title} " in note_norm:
+                best: str | None = None
+                if self.use_terms_phrases:
+                    for phrase in self.phrases.get(item.code, ()):
+                        if f" {phrase} " in note_norm:
+                            best = phrase
+                            break
+                title_words = self.title_text.get(item.code, "")
+                if best is None:
+                    # A verbatim concept mention is strong evidence, but a one-word title
+                    # only counts when that word is rare enough to be specific.
+                    if " " in title_words or self.rare_title_token.get(item.code, False):
+                        if title_words and f" {title_words} " in note_norm:
+                            best = title_words
+                if best:
                     scores[item.code] = scores.get(item.code, 0.0) + self.phrase_bonus
-                    evidence.setdefault(item.code, []).append(f"title phrase: {title}")
-                    sources[item.code] = "exact-phrase"
+                    evidence.setdefault(item.code, []).append(f"phrase: {best}")
+                    if sources.get(item.code) != "clinical-rule":
+                        sources[item.code] = "exact-phrase"
         for pattern, code, reason in CLINICAL_RULES:
             if code not in self.catalogue.codes:
                 continue

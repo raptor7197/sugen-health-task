@@ -144,6 +144,20 @@ def _valid_codes(codes: list[str], catalogue: Catalogue, spare: tuple[str, ...])
     return valid[:3]
 
 
+def _load_terms(mms_path: str | Path) -> dict[str, list[str]] | None:
+    """Load the shipped icd-11 index terms if present. Optional by design."""
+    resolved = Path(mms_path).resolve()
+    candidate = resolved.parents[2] / "data/icd11_terms.json.gz"
+    if not candidate.exists():
+        return None
+    import gzip
+
+    with gzip.open(candidate, "rt", encoding="utf-8") as stream:
+        payload = json.load(stream)
+    codes = payload.get("codes") if isinstance(payload, dict) else None
+    return codes if isinstance(codes, dict) else None
+
+
 def run(
     input_path: str,
     output_path: str,
@@ -164,7 +178,7 @@ def run(
                             training_rows.append(json.loads(line))
                         except json.JSONDecodeError:
                             continue
-        coder = Coder(catalogue, training_rows)
+        coder = Coder(catalogue, training_rows, terms=_load_terms(mms_path))
     spare = tuple(sorted(catalogue.codes))
     model = ModelReranker(coder) if api_enabled is not False else None
     audit_stream = None

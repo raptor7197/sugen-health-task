@@ -8,5 +8,6 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY coder/ /app/coder/
 COPY public/data/mms-2026-01.json /app/public/data/mms-2026-01.json
 COPY public/data/dev_notes.jsonl /app/public/data/dev_notes.jsonl
+COPY data/icd11_terms.json.gz /app/data/icd11_terms.json.gz
 RUN mkdir -p /in /out
 ENTRYPOINT ["python", "-m", "coder"]
