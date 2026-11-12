@@ -1,7 +1,10 @@
 import random
+import sys
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from coder.catalog import Catalogue
-from coder.engine import Coder
+from coder.engine import Coder, _query_tokens
 
 root = Path(__file__).resolve().parents[1]
 catalogue = Catalogue.load(root / "public/data/mms-2026-01.json")
@@ -10,7 +13,7 @@ rows = list(catalogue.categories.values())
 selected = random.Random(20261111).sample(rows, min(1000, len(rows)))
 hits = {1: 0, 3: 0}
 for category in selected:
-    ranked = coder._rank(category.title)
+    ranked = coder._rank(_query_tokens(category.title))
     predictions = [item.code for item in ranked[:3]]
     hits[1] += bool(predictions and predictions[0] == category.code)
     hits[3] += category.code in predictions
