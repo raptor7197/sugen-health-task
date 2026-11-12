@@ -8,6 +8,8 @@ is optional. graded command:
 docker compose run coder /in/notes.jsonl /out/predictions.jsonl
 ```
 
+## architecture
+
 ```mermaid
 flowchart TD
   subgraph build["build time (network allowed)"]
@@ -38,11 +40,14 @@ different-distribution slice and the shipped artefact covers english and spanish
 
 ## data added, and where from
 
-- **who icd-11 index terms**, release 2026-01, from the icd api (`id.who.int`, registered
-  client id): 18,375 codes, about 200k phrases, english and spanish, shipped as one
-  1.5 mb gzipped file. built by `scripts/fetch_terms.py` (resumable, threaded, one
-  connection per thread) then `scripts/build_terms.py`. build time only, so the graded
-  run touches no network.
+- **who icd-11 index terms**, release 2026-01, from the who icd api: a bearer token from
+  `icdaccessmanagement.who.int/connect/token`, then one call per category to
+  `id.who.int/icd/release/11/2026-01/mms/<id>` reading `indexTerm` and `synonym`.
+  18,375 codes, about 200k phrases, english and spanish, shipped as one 1.5 mb gzipped
+  file. `ICD_CLIENT_ID` and `ICD_CLIENT_SECRET` stay in the environment;
+  `scripts/fetch_terms.py` (resumable, threaded, one connection per thread) then
+  `scripts/build_terms.py` produce the file. build time only: the graded run touches no
+  network.
 - **clinical vocabulary** in `coder/lexicon.py`: spelling folds, standard abbreviations,
   lay synonyms. written by hand, no dataset, no licence question.
 - nothing else. the release, the 60 notes and the scorer are the supplied pack.
