@@ -124,11 +124,11 @@ class Coder:
         use_lexicon: bool = True,
         use_post_negation: bool = True,
         use_phrase_bonus: bool = True,
-        phrase_bonus: float = 20.0,
+        phrase_bonus: float = 30.0,
         use_specificity: bool = True,
         neighbour_weight: float = 12.0,
         neighbour_count: int = 5,
-        bm25_b: float = 1.0,
+        bm25_b: float = 0.9,
         bm25_k1: float = 1.2,
         use_bigrams: bool = True,
         bigram_weight: float = 8.0,
@@ -139,7 +139,13 @@ class Coder:
         use_terms_index: bool = True,
         use_terms_phrases: bool = True,
         title_repeat: int = 1,
-        max_phrases: int = 8,
+        max_phrases: int = 16,
+        phrase_len_scaling: bool = False,
+        bigram_idf: bool = True,
+        rule_mode: str = "absolute",
+        rule_relative: float = 1.15,
+        phrase_anchor_boost: float = 1.0,
+        top_k: int = TOP_K,
     ):
         self.catalogue = catalogue
         self.anchor_weight = anchor_weight
@@ -164,6 +170,12 @@ class Coder:
         self.use_terms_phrases = use_terms_phrases
         self.title_repeat = title_repeat
         self.max_phrases = max_phrases
+        self.phrase_len_scaling = phrase_len_scaling
+        self.bigram_idf = bigram_idf
+        self.rule_mode = rule_mode
+        self.rule_relative = rule_relative
+        self.phrase_anchor_boost = phrase_anchor_boost
+        self.top_k = top_k
         term_source = terms or {}
         self.docs = list(catalogue.categories.values())
         self.df: Counter[str] = Counter()
@@ -281,7 +293,7 @@ class Coder:
             else:
                 factor = 1.0
             adjusted[code] = score * self.discount.get(code, 1.0) * factor + self.length_bonus.get(code, 0.0)
-        best = heapq.nlargest(TOP_K, adjusted.items(), key=lambda item: (item[1], item[0]))
+        best = heapq.nlargest(self.top_k, adjusted.items(), key=lambda item: (item[1], item[0]))
         return [Ranked(code, score, tuple(matched.get(code, ())[:8])) for code, score in best]
 
     def _example_matches(self, query: Counter[str], exclude_id: str | None = None) -> list[tuple[float, str, list[str]]]:
@@ -310,8 +322,8 @@ class Coder:
         specific supported code, so a parent must never outrank its own child.
         """
         if not self.use_specificity:
-            return sorted(scores, key=lambda code: (-scores[code], code))[:TOP_K]
-        ordered = sorted(scores, key=lambda code: (-scores[code], code))[:TOP_K]
+            return sorted(scores, key=lambda code: (-scores[code], code))[:self.top_k]
+        ordered = sorted(scores, key=lambda code: (-scores[code], code))[:self.top_k]
         present = set(ordered)
         keep: list[str] = []
         for code in ordered:
@@ -370,14 +382,28 @@ class Coder:
                 if pair in self.bigrams:
                     seen[pair] += 1
             for pair, count in seen.items():
+                pair_weight = self.bigram_weight
+                if self.bigram_idf:
+                    # a pair shared by thousands of titles says little; a rare pair says a lot
+                    rarity = len(self.bigrams[pair])
+                    pair_weight = self.bigram_weight * min(1.0, 20.0 / max(1, rarity))
                 for code in self.bigrams[pair]:
-                    scores[code] = scores.get(code, 0.0) + self.bigram_weight * min(count, 2)
+                    scores[code] = scores.get(code, 0.0) + pair_weight * min(count, 2)
                     evidence.setdefault(code, []).append(f"phrase pair: {pair}")
                     if sources.get(code) != "clinical-rule":
                         sources[code] = "bigram-match"
         if self.use_phrase_bonus:
             note_norm = " " + " ".join(words) + " "
-            for item in ranked[:TOP_K]:
+            anchor_norm = ""
+            if self.phrase_anchor_boost != 1.0:
+                anchor_tokens = [
+                    token for match in DIAGNOSIS_RE.finditer(safe_text)
+                    for token in self._tokens(match.group(1) or match.group(2) or "")
+                    if token not in STOP
+                ]
+                if anchor_tokens:
+                    anchor_norm = " " + " ".join(anchor_tokens) + " "
+            for item in ranked[:self.top_k]:
                 best: str | None = None
                 if self.use_terms_phrases:
                     for phrase in self.phrases.get(item.code, ()):
@@ -392,7 +418,16 @@ class Coder:
                         if title_words and f" {title_words} " in note_norm:
                             best = title_words
                 if best:
-                    scores[item.code] = scores.get(item.code, 0.0) + self.phrase_bonus
+                    bonus = self.phrase_bonus
+                    if self.phrase_len_scaling:
+                        words_in_phrase = len(best.split())
+                        if words_in_phrase <= 2:
+                            bonus = self.phrase_bonus * 0.35
+                        elif words_in_phrase == 3:
+                            bonus = self.phrase_bonus * 0.7
+                    if anchor_norm and f" {best} " in anchor_norm:
+                        bonus = bonus * self.phrase_anchor_boost
+                    scores[item.code] = scores.get(item.code, 0.0) + bonus
                     evidence.setdefault(item.code, []).append(f"phrase: {best}")
                     if sources.get(item.code) != "clinical-rule":
                         sources[item.code] = "exact-phrase"
@@ -405,7 +440,12 @@ class Coder:
                 suffix = TOKEN_RE.findall(safe_text[match.end():match.end() + 24].lower())[:2]
                 if any(token in POST_NEGATORS for token in suffix):
                     continue
-                scores[code] = max(scores.get(code, 0.0), 100.0)
+                if self.rule_mode == "absolute":
+                    rule_score = 100.0
+                else:
+                    current_top = max(scores.values()) if scores else 0.0
+                    rule_score = current_top * self.rule_relative + 3.0
+                scores[code] = max(scores.get(code, 0.0), rule_score)
                 evidence.setdefault(code, []).append(reason)
                 sources[code] = "clinical-rule"
                 break
