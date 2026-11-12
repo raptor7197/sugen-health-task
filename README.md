@@ -29,10 +29,10 @@ flowchart TD
 
 `python3 public/score.py --gold public/data/dev_notes.jsonl --pred out/dev_predictions.jsonl --mms public/data/mms-2026-01.json`
 
-**44.2 / 75** on the 60 dev notes: top-1 0.533, top-3 0.700, zero missing, zero invalid.
-split-half scores 43.3 and 45.0, so it is not one lucky note. it started at 21.2.
+**48.3 / 75** on the 60 dev notes: top-1 0.617, top-3 0.700, zero missing, zero invalid.
+split-half scores 46.7 and 50.0, so it is not one lucky note. it started at 21.2.
 
-hidden estimate: **50-59 / 100, low confidence**. the gain came from terminology rather
+hidden estimate: **55-64 / 100, low confidence**. the gain came from terminology rather
 than tuning, which should transfer, but only 25 of the 100 points sit in the
 different-distribution slice and the shipped artefact covers english and spanish only.
 

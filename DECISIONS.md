@@ -112,3 +112,17 @@
 - Decision: stop fetching extra languages and cut the README back to the brief's one-page limit. The README had grown to 12 KB across ten sections, which the brief does not allow; extra languages were the same one-command extension as Spanish, not new capability.
 - Evidence: brief section "Deliverable" item 2 says "A README of one page at most" and lists four required points; the rewritten file covers those four plus a mermaid diagram and the run command.
 - Revisit: if the reviewer wants depth, the reasoning lives in this log and in `scripts/experiments/`, not in the README.
+
+## 2026-11-12 22:20 IST — precision fixes worth 4.1 points
+
+- Commit: `bdce1ed`
+- Decision: weight a shared title bigram by how rare that pair is across the release, raise phrase credit to 30, loosen length normalisation to `b = 0.9`, and keep 16 phrases per code in the matcher. Options: leave the additive weights alone at 44.2, or fit weights per feature.
+- Evidence: bigram rarity 44.2 to 45.0; phrase credit 30 with `b = 0.9` to 47.5; 16 phrases to 48.3, split halves 46.7/50.0. Diagnosis first: of the nine notes losing with gold already in the top-24, three were won by a single generic bigram ("death from direct obstetric cause" over gestational diabetes) and two by a short phrase match ("torticollis" over mumps).
+- Revisit: rarity normalisation is a proxy for information content; a proper idf over pairs would be the principled version.
+
+## 2026-11-12 22:24 IST — what lost this round
+
+- Commit: `bdce1ed`
+- Decision: reject four further ideas rather than ship them.
+- Evidence: phrase credit scaled down for short phrases 44.2 to 40.8 (short phrases were doing real work); multiplying the phrase bonus when the phrase sits inside the assessment span 47.5 to 45.8 to 46.7 at 1.5x and 2x; rules scored relative to the current top rather than an absolute 100 was exactly neutral, so the absolute stays; top 128 candidates instead of 64 scored 46.2; neighbour weight and anchor weight moved nothing at all.
+- Revisit: the anchor-span idea should work with a better span detector than "the line after `dx:`"; it was measured on a weak implementation of the idea.
