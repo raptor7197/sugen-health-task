@@ -67,6 +67,19 @@ class PredictionTests(unittest.TestCase):
         codes = self.coder.rerank("malaria", ["1F40.Z&XK8G", "NOT-A-CODE"])
         self.assertEqual(codes[0], "1F40.Z")
 
+    def test_lay_term_reaches_the_catalogue_concept(self):
+        codes, _ = self.coder.predict("27F vaginal thrush, thick white discharge, no odour.")
+        self.assertEqual(codes[0], "1F23.10")
+
+    def test_multiword_concept_beats_unrelated_fever_codes(self):
+        codes, _ = self.coder.predict("Fever, cough, and investigation shows respiratory tuberculosis confirmed.")
+        self.assertEqual(codes[0], "1B10.0")
+
+    def test_post_negation_suppresses_excluded_diagnosis(self):
+        codes, _ = self.coder.predict("Fever and body aches. Malaria excluded on smear. Dengue ruled out.")
+        self.assertNotIn("1F40.Z", codes)
+        self.assertNotIn("1F4Z", codes)
+
 
 class TrainingLeakageTests(unittest.TestCase):
     def test_leave_one_out_never_reuses_current_note_label(self):

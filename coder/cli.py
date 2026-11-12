@@ -150,19 +150,21 @@ def run(
     mms_path: str | Path = DEFAULT_MMS,
     audit_path: str | None = None,
     api_enabled: bool | None = None,
+    coder: Coder | None = None,
 ) -> dict[str, int]:
     catalogue = Catalogue.load(mms_path)
-    training_path = Path(mms_path).with_name("dev_notes.jsonl")
-    training_rows: list[dict[str, Any]] = []
-    if training_path.exists():
-        with open(training_path, encoding="utf-8") as training_file:
-            for line in training_file:
-                if line.strip():
-                    try:
-                        training_rows.append(json.loads(line))
-                    except json.JSONDecodeError:
-                        continue
-    coder = Coder(catalogue, training_rows)
+    if coder is None:
+        training_path = Path(mms_path).with_name("dev_notes.jsonl")
+        training_rows: list[dict[str, Any]] = []
+        if training_path.exists():
+            with open(training_path, encoding="utf-8") as training_file:
+                for line in training_file:
+                    if line.strip():
+                        try:
+                            training_rows.append(json.loads(line))
+                        except json.JSONDecodeError:
+                            continue
+        coder = Coder(catalogue, training_rows)
     spare = tuple(sorted(catalogue.codes))
     model = ModelReranker(coder) if api_enabled is not False else None
     audit_stream = None
